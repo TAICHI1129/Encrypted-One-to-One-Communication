@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -22,9 +21,9 @@ import (
 const defaultPort = "9999"
 
 type EOTOCApp struct {
-	app       fyne.App
-	window    fyne.Window
-	trust     *TrustStore
+	app    fyne.App
+	window fyne.Window
+	trust  *TrustStore
 
 	destination *widget.Entry
 	message     *widget.Entry
@@ -40,16 +39,11 @@ type EOTOCApp struct {
 }
 
 func main() {
-	eotoc := app.NewWithID(
-		"com.eotoc.app",
-	)
+	eotoc := app.NewWithID("com.eotoc.app")
 
 	trust, err := NewTrustStore()
 	if err != nil {
-		fmt.Printf(
-			"[-] Trust store error: %v\n",
-			err,
-		)
+		fmt.Printf("[-] Failed to initialize trust store: %v\n", err)
 		return
 	}
 
@@ -59,58 +53,39 @@ func main() {
 		received: make([]string, 0),
 	}
 
-	ui.window = eotoc.NewWindow(
-		"EOTOC",
-	)
-
+	ui.window = eotoc.NewWindow("EOTOC")
 	ui.buildUI()
 
 	go ui.startServer()
 
-	ui.window.Resize(
-		fyne.NewSize(760, 650),
-	)
-
+	ui.window.Resize(fyne.NewSize(760, 650))
 	ui.window.ShowAndRun()
 }
 
 func (e *EOTOCApp) buildUI() {
 	e.destination = widget.NewEntry()
-	e.destination.SetPlaceHolder(
-		"eotoc://192.168.1.20:9999",
-	)
+	e.destination.SetPlaceHolder("eotoc://192.168.1.20:9999")
 
 	e.message = widget.NewMultiLineEntry()
-	e.message.SetPlaceHolder(
-		"Enter your message...",
-	)
+	e.message.SetPlaceHolder("Enter your message...")
 
-	e.fileLabel = widget.NewLabel(
-		"No attachment selected",
-	)
+	e.fileLabel = widget.NewLabel("No attachment selected")
 
-	e.status = widget.NewLabel(
-		"● Server starting...",
-	)
+	e.status = widget.NewLabel("● Server starting...")
+	e.identity = widget.NewLabel("Server identity: loading...")
 
-	e.identity = widget.NewLabel(
-		"Server identity: loading...",
-	)
-
-	selectFile := widget.NewButton(
+	selectFileButton := widget.NewButton(
 		"Select File",
 		func() {
 			e.selectFile()
 		},
 	)
 
-	clearFile := widget.NewButton(
+	clearFileButton := widget.NewButton(
 		"Clear",
 		func() {
 			e.selectedFile = ""
-			e.fileLabel.SetText(
-				"No attachment selected",
-			)
+			e.fileLabel.SetText("No attachment selected")
 		},
 	)
 
@@ -121,7 +96,7 @@ func (e *EOTOCApp) buildUI() {
 		},
 	)
 
-	refreshIdentity := widget.NewButton(
+	showIdentityButton := widget.NewButton(
 		"Show Identity",
 		func() {
 			e.showLocalIdentity()
@@ -138,10 +113,8 @@ func (e *EOTOCApp) buildUI() {
 			e.receivedMu.Lock()
 			defer e.receivedMu.Unlock()
 
-			if id < len(e.received) {
-				label.SetText(
-					e.received[id],
-				)
+			if id >= 0 && id < len(e.received) {
+				label.SetText(e.received[id])
 			}
 		},
 		func() int {
@@ -152,28 +125,31 @@ func (e *EOTOCApp) buildUI() {
 		},
 	)
 
-	identityBox := container.NewVBox(
-		e.status,
-		e.identity,
-		refreshIdentity,
-	)
-
 	fileBox := container.NewBorder(
 		nil,
 		nil,
-		selectFile,
-		clearFile,
+		selectFileButton,
+		clearFileButton,
 		e.fileLabel,
 	)
 
 	sendBox := container.NewVBox(
 		widget.NewLabel("Destination"),
 		e.destination,
+
 		widget.NewLabel("Message"),
 		e.message,
+
 		widget.NewLabel("Attachment"),
 		fileBox,
+
 		sendButton,
+	)
+
+	identityBox := container.NewVBox(
+		e.status,
+		e.identity,
+		showIdentityButton,
 	)
 
 	receivedBox := container.NewBorder(
@@ -202,10 +178,7 @@ func (e *EOTOCApp) selectFile() {
 	dialog.NewFileOpen(
 		func(reader fyne.URIReadCloser, err error) {
 			if err != nil {
-				dialog.ShowError(
-					err,
-					e.window,
-				)
+				dialog.ShowError(err, e.window)
 				return
 			}
 
@@ -238,9 +211,7 @@ func (e *EOTOCApp) selectFile() {
 }
 
 func (e *EOTOCApp) send() {
-	raw := strings.TrimSpace(
-		e.destination.Text,
-	)
+	raw := strings.TrimSpace(e.destination.Text)
 
 	if raw == "" {
 		dialog.ShowInformation(
@@ -253,17 +224,15 @@ func (e *EOTOCApp) send() {
 
 	address, err := parseEOTOCAddress(raw)
 	if err != nil {
-		dialog.ShowError(
-			err,
-			e.window,
-		)
+		dialog.ShowError(err, e.window)
 		return
 	}
 
 	message := e.message.Text
+	filePath := e.selectedFile
 
 	if strings.TrimSpace(message) == "" &&
-		e.selectedFile == "" {
+		filePath == "" {
 		dialog.ShowInformation(
 			"EOTOC",
 			"Enter a message or select a file.",
@@ -272,17 +241,13 @@ func (e *EOTOCApp) send() {
 		return
 	}
 
-	e.status.SetText(
-		"● Connecting...",
-	)
+	e.status.SetText("● Connecting...")
 
-	go func() {
-		e.sendToAddress(
-			address,
-			message,
-			e.selectedFile,
-		)
-	}()
+	go e.sendToAddress(
+		address,
+		message,
+		filePath,
+	)
 }
 
 func (e *EOTOCApp) sendToAddress(
@@ -290,17 +255,15 @@ func (e *EOTOCApp) sendToAddress(
 	message string,
 	filePath string,
 ) {
-	expected, trusted := e.trust.Get(address)
+	expectedFingerprint, trusted :=
+		e.trust.Get(address)
 
 	conn, err := dialEOTOC(
 		address,
-		expected,
+		expectedFingerprint,
 	)
-
 	if err != nil {
-		e.status.SetText(
-			"● Connection rejected",
-		)
+		e.status.SetText("● Connection rejected")
 
 		dialog.ShowError(
 			fmt.Errorf(
@@ -342,9 +305,8 @@ func (e *EOTOCApp) sendToAddress(
 			"This server is not trusted yet.\n\n"+
 				"Address:\n%s\n\n"+
 				"SHA-256 fingerprint:\n%s\n\n"+
-				"Only trust this server if you have "+
-				"verified this fingerprint through a "+
-				"trusted channel.",
+				"Verify this fingerprint through a "+
+				"trusted channel before trusting it.",
 			address,
 			actualFingerprint,
 		)
@@ -376,9 +338,6 @@ func (e *EOTOCApp) sendToAddress(
 			return
 		}
 
-		// Reconnect after the user has explicitly trusted
-		// the identity. No application payload was sent
-		// before this point.
 		conn, err = dialEOTOC(
 			address,
 			actualFingerprint,
@@ -397,62 +356,106 @@ func (e *EOTOCApp) sendToAddress(
 
 	defer conn.Close()
 
+	var file *os.File
+	var fileSize int64
+	var fileName string
+	packetType := packetMessage
+
+	if filePath != "" {
+		file, err = os.Open(filePath)
+		if err != nil {
+			dialog.ShowError(
+				fmt.Errorf(
+					"could not open attachment:\n%w",
+					err,
+				),
+				e.window,
+			)
+			return
+		}
+
+		defer file.Close()
+
+		info, err := file.Stat()
+		if err != nil {
+			dialog.ShowError(err, e.window)
+			return
+		}
+
+		if !info.Mode().IsRegular() {
+			dialog.ShowError(
+				fmt.Errorf(
+					"attachment is not a regular file",
+				),
+				e.window,
+			)
+			return
+		}
+
+		fileSize = info.Size()
+
+		if fileSize > maxFileSize {
+			dialog.ShowError(
+				fmt.Errorf(
+					"file exceeds the 1 GiB limit",
+				),
+				e.window,
+			)
+			return
+		}
+
+		fileName = filepath.Base(info.Name())
+
+		if fileName == "" ||
+			fileName == "." ||
+			fileName == string(filepath.Separator) {
+			dialog.ShowError(
+				fmt.Errorf("invalid filename"),
+				e.window,
+			)
+			return
+		}
+
+		if len([]byte(fileName)) >
+			int(maxFileNameSize) {
+			dialog.ShowError(
+				fmt.Errorf(
+					"filename is too long",
+				),
+				e.window,
+			)
+			return
+		}
+
+		packetType = packetMessageFile
+	}
+
+	packet := Packet{
+		Type:     packetType,
+		Message:  message,
+		FileName: fileName,
+		FileSize: fileSize,
+	}
+
 	if err := writePacket(
 		conn,
-		Packet{
-			Type: func() byte {
-				if filePath != "" {
-					return packetMessageFile
-				}
-				return packetMessage
-			}(),
-			Message: message,
-			FileName: func() string {
-				if filePath == "" {
-					return ""
-				}
-				return filepath.Base(filePath)
-			}(),
-			FileSize: func() int64 {
-				if filePath == "" {
-					return 0
-				}
-
-				info, err := os.Stat(filePath)
-				if err != nil {
-					return 0
-				}
-
-				return info.Size()
-			}(),
-		},
-		func() *os.File {
-			if filePath == "" {
-				return nil
-			}
-
-			file, err := os.Open(filePath)
-			if err != nil {
-				return nil
-			}
-
-			return file
-		}(),
+		packet,
+		file,
 	); err != nil {
-		e.status.SetText(
-			"● Send failed",
-		)
+		e.status.SetText("● Send failed")
 
 		dialog.ShowError(
-			err,
+			fmt.Errorf(
+				"send failed:\n%w",
+				err,
+			),
 			e.window,
 		)
+
 		return
 	}
 
-	e.status.SetText(
-		"● Secure connection established",
-	)
+	e.status.SetText("● Secure connection / sent")
 
 	dialog.ShowInformation(
 		"Sent",
@@ -466,15 +469,15 @@ func (e *EOTOCApp) startServer() {
 		"● Starting secure server...",
 	)
 
+	e.updateIdentityLabel()
+
 	err := startEOTOCServer(
 		defaultPort,
 		e.handleIncoming,
 	)
 
 	if err != nil {
-		e.status.SetText(
-			"● Server error",
-		)
+		e.status.SetText("● Server error")
 
 		fmt.Printf(
 			"[-] Server error: %v\n",
@@ -482,6 +485,43 @@ func (e *EOTOCApp) startServer() {
 		)
 		return
 	}
+}
+
+func (e *EOTOCApp) updateIdentityLabel() {
+	cert, err := generateServerCertificate()
+	if err != nil {
+		e.identity.SetText(
+			"Server identity: unavailable",
+		)
+		return
+	}
+
+	if len(cert.Certificate) == 0 {
+		e.identity.SetText(
+			"Server identity: unavailable",
+		)
+		return
+	}
+
+	parsed, err := x509.ParseCertificate(
+		cert.Certificate[0],
+	)
+	if err != nil {
+		e.identity.SetText(
+			"Server identity: invalid",
+		)
+		return
+	}
+
+	fingerprint := fingerprintCertificate(parsed)
+
+	e.identity.SetText(
+		"Server fingerprint: " + fingerprint,
+	)
+
+	e.status.SetText(
+		"● Secure server listening on :" + defaultPort,
+	)
 }
 
 func (e *EOTOCApp) handleIncoming(
@@ -533,61 +573,47 @@ func (e *EOTOCApp) handleIncoming(
 func (e *EOTOCApp) showLocalIdentity() {
 	cert, err := generateServerCertificate()
 	if err != nil {
-		dialog.ShowError(
-			err,
-			e.window,
-		)
+		dialog.ShowError(err, e.window)
 		return
 	}
 
 	if len(cert.Certificate) == 0 {
-		return
-	}
-
-	x509Cert, err := tls.X509KeyPair(
-		cert.Certificate[0],
-		cert.PrivateKey,
-	)
-	_ = x509Cert
-
-	if err != nil {
-		return
-	}
-
-	parsed, err := parseCertificate(
-		cert.Certificate[0],
-	)
-	if err != nil {
 		dialog.ShowError(
-			err,
+			fmt.Errorf(
+				"server certificate is empty",
+			),
 			e.window,
 		)
 		return
 	}
 
-	fingerprint := fingerprintCertificate(
-		parsed,
+	parsed, err := x509.ParseCertificate(
+		cert.Certificate[0],
 	)
+	if err != nil {
+		dialog.ShowError(err, e.window)
+		return
+	}
+
+	fingerprint := fingerprintCertificate(parsed)
 
 	dialog.ShowInformation(
 		"EOTOC Server Identity",
-		"SHA-256 fingerprint:\n\n"+fingerprint+
+		"SHA-256 fingerprint:\n\n"+
+			fingerprint+
 			"\n\nThis fingerprint identifies this "+
 			"EOTOC installation.",
 		e.window,
 	)
 }
 
-func parseCertificate(
-	der []byte,
-) (*x509.Certificate, error) {
-	return x509.ParseCertificate(der)
-}
-
 func parseEOTOCAddress(raw string) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf(
+			"invalid EOTOC URI: %w",
+			err,
+		)
 	}
 
 	if parsed.Scheme != "eotoc" {
@@ -602,14 +628,56 @@ func parseEOTOCAddress(raw string) (string, error) {
 		)
 	}
 
+	if parsed.User != nil {
+		return "", fmt.Errorf(
+			"user information is not supported",
+		)
+	}
+
+	if parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return "", fmt.Errorf(
+			"query strings and fragments are not supported",
+		)
+	}
+
 	host := parsed.Host
 
-	if !strings.Contains(host, ":") {
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		if strings.Contains(host, ":") {
+			return "", fmt.Errorf(
+				"IPv6 addresses must include a port",
+			)
+		}
+
 		host = net.JoinHostPort(
 			host,
 			defaultPort,
 		)
 	}
 
-	return host, nil
+	hostname, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return "", fmt.Errorf(
+			"invalid destination: %w",
+			err,
+		)
+	}
+
+	if hostname == "" {
+		return "", fmt.Errorf(
+			"destination host is empty",
+		)
+	}
+
+	if port == "" {
+		return "", fmt.Errorf(
+			"destination port is empty",
+		)
+	}
+
+	return net.JoinHostPort(
+		hostname,
+		port,
+	), nil
 }
