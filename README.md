@@ -1,4 +1,4 @@
-# EOTOC — Encrypted One-to-One Communication
+# EOTOC — Encrypted One-to-One Communication System
 
 A 1-on-1 encrypted peer-to-peer communication tool written in Go.
 It combines RSA-based hybrid key exchange, chunked AES-256-GCM stream
